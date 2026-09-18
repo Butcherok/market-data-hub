@@ -24,6 +24,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  whoami: () => req<{ name: string | null; auth_required: boolean }>("/api/whoami"),
   getMarkets: () => req<MarketInfo[]>("/api/markets"),
   getSymbols: (market: string) => req<string[]>(`/api/symbols?market=${encodeURIComponent(market)}`),
   getSummary: () => req<Summary>("/api/summary"),
