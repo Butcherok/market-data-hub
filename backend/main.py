@@ -3,7 +3,14 @@
 Не торговая логика, чек-лист боевого бота к этому файлу не применяется.
 
 Запуск: uvicorn main:app --host 0.0.0.0 --port 8000
-(см. README.md для установки зависимостей и доступа через Tailscale)
+(см. README.md для установки зависимостей, доступа через Tailscale и
+публикации наружу через Cloudflare Tunnel)
+
+Авторизация — персональные токены на человека (см. auth.py, manage_users.py),
+не общий секрет. Пока в БД нет ни одного пользователя, все /api/* открыты
+(рассчитано на то, что доступ и так ограничен сетью — localhost/Tailscale).
+Как только через manage_users.py создан первый пользователь — КАЖДЫЙ
+запрос от КАЖДОГО, включая владельца, требует валидный Bearer-токен.
 """
 import csv
 import io
@@ -12,20 +19,21 @@ import time
 from typing import Optional
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 
+import auth
 import db as dbmod
 import jobs as jobsmod
 from collector import RateLimitedSession, list_symbols
-from config import MARKETS, VIEW_TIMEFRAMES, AUTH_TOKEN, DB_PATH
+from config import MARKETS, VIEW_TIMEFRAMES, ALLOWED_ORIGIN, DB_PATH
 
 app = FastAPI(title="Market Data Hub API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[ALLOWED_ORIGIN] if ALLOWED_ORIGIN else ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -34,12 +42,23 @@ _symbols_cache: dict[str, tuple[float, list[str]]] = {}
 SYMBOLS_CACHE_TTL = 300
 
 
-def check_auth(authorization: Optional[str] = Header(None)):
-    if not AUTH_TOKEN:
-        return  # авторизация не настроена — например, доступ уже ограничен Tailscale-сетью
-    expected = f"Bearer {AUTH_TOKEN}"
-    if authorization != expected:
+def check_auth(request: Request, authorization: Optional[str] = Header(None)) -> Optional[dict]:
+    """Возвращает словарь пользователя {id, name} если авторизация настроена и
+    токен валиден; None, если авторизация ещё не настроена (пользователей нет
+    в БД — старый режим, доступ ограничен только сетью). Логирует обращение,
+    если пользователь определён."""
+    conn = dbmod.get_conn()
+    if not auth.auth_required(conn):
+        return None
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    token = authorization[len("Bearer "):].strip()
+    user = auth.resolve_token(conn, token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    auth.touch_last_seen(conn, user["id"])
+    auth.log_access(conn, user["id"], request.method, request.url.path)
+    return user
 
 
 def require_market(market: str):
@@ -52,15 +71,23 @@ def health():
     return {"ok": True}
 
 
+@app.get("/api/whoami")
+def whoami(request: Request, authorization: Optional[str] = Header(None)):
+    """Кто я, по мнению сервера — фронтенд показывает это в шапке, чтобы
+    приглашённый человек видел, под каким именем он вошёл."""
+    user = check_auth(request, authorization)
+    return {"name": user["name"] if user else None, "auth_required": auth.auth_required(dbmod.get_conn())}
+
+
 @app.get("/api/markets")
-def get_markets(authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
+def get_markets(request: Request, authorization: Optional[str] = Header(None)):
+    check_auth(request, authorization)
     return [{"id": k, "label": v["label"]} for k, v in MARKETS.items()]
 
 
 @app.get("/api/symbols")
-def get_symbols(market: str = Query(...), authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
+def get_symbols(request: Request, market: str = Query(...), authorization: Optional[str] = Header(None)):
+    check_auth(request, authorization)
     require_market(market)
 
     cached = _symbols_cache.get(market)
@@ -77,8 +104,8 @@ def get_symbols(market: str = Query(...), authorization: Optional[str] = Header(
 
 
 @app.get("/api/summary")
-def get_summary(authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
+def get_summary(request: Request, authorization: Optional[str] = Header(None)):
+    check_auth(request, authorization)
     conn = dbmod.get_conn()
     return {
         "markets": dbmod.get_summary(conn),
@@ -87,24 +114,28 @@ def get_summary(authorization: Optional[str] = Header(None)):
 
 
 @app.get("/api/gaps")
-def get_gaps(market: str, symbol: str, authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
+def get_gaps(request: Request, market: str, symbol: str, authorization: Optional[str] = Header(None)):
+    check_auth(request, authorization)
     require_market(market)
     conn = dbmod.get_conn()
     return dbmod.get_gaps(conn, market, symbol)
 
 
 @app.post("/api/jobs")
-def start_job(market: str = Query(...), symbol: str = Query(...), authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
+def start_job(request: Request, market: str = Query(...), symbol: str = Query(...), authorization: Optional[str] = Header(None)):
+    user = check_auth(request, authorization)
     require_market(market)
-    job = jobsmod.manager.start(market, symbol)
+    started_by = user["name"] if user else None
+    try:
+        job = jobsmod.manager.start(market, symbol, started_by=started_by)
+    except jobsmod.JobLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
     return job.to_dict()
 
 
 @app.get("/api/jobs")
-def list_jobs(authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
+def list_jobs(request: Request, authorization: Optional[str] = Header(None)):
+    check_auth(request, authorization)
     active = [j.to_dict() for j in jobsmod.manager.list()]
     conn = dbmod.get_conn()
     history = dbmod.list_jobs_log(conn)
@@ -112,8 +143,8 @@ def list_jobs(authorization: Optional[str] = Header(None)):
 
 
 @app.get("/api/jobs/{job_id}")
-def get_job(job_id: str, authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
+def get_job(request: Request, job_id: str, authorization: Optional[str] = Header(None)):
+    check_auth(request, authorization)
     job = jobsmod.manager.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job не найден")
@@ -121,8 +152,8 @@ def get_job(job_id: str, authorization: Optional[str] = Header(None)):
 
 
 @app.post("/api/jobs/{job_id}/cancel")
-def cancel_job(job_id: str, authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
+def cancel_job(request: Request, job_id: str, authorization: Optional[str] = Header(None)):
+    check_auth(request, authorization)
     ok = jobsmod.manager.cancel(job_id)
     if not ok:
         raise HTTPException(status_code=400, detail="job не запущен или не найден")
@@ -130,8 +161,8 @@ def cancel_job(job_id: str, authorization: Optional[str] = Header(None)):
 
 
 @app.get("/api/jobs/{job_id}/stream")
-def stream_job(job_id: str, authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
+def stream_job(request: Request, job_id: str, authorization: Optional[str] = Header(None)):
+    check_auth(request, authorization)
     job = jobsmod.manager.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job не найден")
@@ -183,11 +214,12 @@ def _resample(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
 
 @app.get("/api/data/preview")
 def data_preview(
+    request: Request,
     market: str, symbol: str, timeframe: str = "1h",
     start: Optional[int] = None, end: Optional[int] = None, limit: int = 1000,
     authorization: Optional[str] = Header(None),
 ):
-    check_auth(authorization)
+    check_auth(request, authorization)
     require_market(market)
     conn = dbmod.get_conn()
     df = _load_range_df(conn, market, symbol, start, end)
@@ -202,11 +234,12 @@ def data_preview(
 
 @app.get("/api/data/export")
 def data_export(
+    request: Request,
     market: str, symbol: str, timeframe: str = "1h",
     start: Optional[int] = None, end: Optional[int] = None,
     authorization: Optional[str] = Header(None),
 ):
-    check_auth(authorization)
+    check_auth(request, authorization)
     require_market(market)
     conn = dbmod.get_conn()
     df = _load_range_df(conn, market, symbol, start, end)
@@ -227,6 +260,6 @@ def data_export(
 
 
 @app.get("/api/data/download-db")
-def download_db(authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
+def download_db(request: Request, authorization: Optional[str] = Header(None)):
+    check_auth(request, authorization)
     return FileResponse(DB_PATH, filename="market_data.db", media_type="application/octet-stream")
