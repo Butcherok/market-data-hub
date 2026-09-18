@@ -2,6 +2,9 @@
 Слой БД: схема, подключение, выборки. Сырые данные (klines) отдельно от
 лога дыр (gaps) — без синтетических/дозаполненных строк в klines (см. бриф
 проекта: политика пропусков решается на этапе анализа, не сбора).
+
+users/access_log — персональные токены доступа и журнал обращений (кто,
+когда, какой эндпоинт). См. auth.py и manage_users.py.
 """
 import os
 import sqlite3
@@ -64,6 +67,24 @@ CREATE TABLE IF NOT EXISTS collection_log (
     gaps_detected           INTEGER DEFAULT 0,
     status                  TEXT    NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS users (
+    id                      TEXT    PRIMARY KEY,
+    name                    TEXT    NOT NULL,
+    token_hash              TEXT    NOT NULL UNIQUE,
+    created_at              INTEGER NOT NULL,
+    last_seen_at            INTEGER,
+    revoked_at              INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS access_log (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id                 TEXT,
+    method                  TEXT    NOT NULL,
+    path                    TEXT    NOT NULL,
+    ts                      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_access_log_ts ON access_log(ts);
 """
 
 _local = threading.local()
