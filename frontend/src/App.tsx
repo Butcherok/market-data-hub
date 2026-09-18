@@ -17,18 +17,46 @@ export default function App() {
   const [viewSymbol, setViewSymbol] = useState("");
   const [viewTimeframe, setViewTimeframe] = useState<ViewTimeframe>("1h");
   const [authToken, setAuthToken] = useState(localStorage.getItem("mdh_auth_token") || "");
+  const [whoami, setWhoami] = useState<{ name: string | null; auth_required: boolean } | null>(null);
+  const [jobError, setJobError] = useState<string | null>(null);
+
+  // Именной токен-ссылка: ?token=... в адресе подхватывается один раз при
+  // заходе, сохраняется в localStorage и убирается из адресной строки (чтобы
+  // не осталась в истории браузера/при пересылке скриншота адреса).
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const urlToken = params.get("token");
+    if (urlToken) {
+      localStorage.setItem("mdh_auth_token", urlToken);
+      setAuthToken(urlToken);
+      params.delete("token");
+      const rest = params.toString();
+      const newUrl = window.location.pathname + (rest ? `?${rest}` : "") + window.location.hash;
+      window.history.replaceState({}, "", newUrl);
+    }
+  }, []);
+
+  const refreshWhoami = useCallback(() => {
+    api.whoami().then(setWhoami).catch(() => setWhoami(null));
+  }, []);
 
   const refreshSummary = useCallback(() => {
     api.getSummary().then(setSummary).catch(() => {});
     api.listJobs().then((r) => setHistory(r.history)).catch(() => {});
   }, []);
 
-  useEffect(() => { refreshSummary(); }, [refreshSummary]);
+  useEffect(() => { refreshSummary(); refreshWhoami(); }, [refreshSummary, refreshWhoami]);
 
   const handleStartCollection = async (market: string, symbol: string) => {
+    setJobError(null);
     setJobRunning(true);
-    const job = await api.startJob(market, symbol);
-    setActiveJobId(job.id);
+    try {
+      const job = await api.startJob(market, symbol);
+      setActiveJobId(job.id);
+    } catch (e: any) {
+      setJobRunning(false);
+      setJobError(String(e?.message || e));
+    }
   };
 
   const handleViewChange = useCallback((market: string, symbol: string, timeframe: ViewTimeframe) => {
@@ -51,6 +79,7 @@ export default function App() {
     if (authToken) localStorage.setItem("mdh_auth_token", authToken);
     else localStorage.removeItem("mdh_auth_token");
     refreshSummary();
+    refreshWhoami();
   };
 
   return (
@@ -60,7 +89,13 @@ export default function App() {
           <h1>Market Data Hub</h1>
           <div className="subtitle">Сбор и просмотр рыночных данных Binance (spot / USDⓈ-M futures)</div>
         </div>
-        <div className="row" style={{ alignItems: "center" }}>
+        <div className="row" style={{ alignItems: "center", gap: 8 }}>
+          {whoami?.name && (
+            <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>Вы: <b>{whoami.name}</b></div>
+          )}
+          {whoami?.auth_required && !whoami?.name && (
+            <div style={{ fontSize: 12, color: "var(--danger, #d33)" }}>токен не распознан</div>
+          )}
           <input
             type="password"
             placeholder="токен доступа (если настроен)"
@@ -71,6 +106,12 @@ export default function App() {
           <button className="secondary" onClick={saveToken} style={{ padding: "6px 12px", fontSize: 12 }}>OK</button>
         </div>
       </div>
+
+      {jobError && (
+        <div className="card" style={{ borderColor: "var(--danger, #d33)", color: "var(--danger, #d33)", fontSize: 13 }}>
+          Не удалось запустить сбор: {jobError}
+        </div>
+      )}
 
       <SummaryCards summary={summary} />
 
