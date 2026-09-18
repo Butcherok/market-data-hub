@@ -39,5 +39,16 @@ VIEW_TIMEFRAMES = {
 }
 
 DB_PATH = os.environ.get("MARKET_DATA_DB_PATH", os.path.join(os.path.dirname(__file__), "data", "market_data.db"))
-AUTH_TOKEN = os.environ.get("MARKET_DATA_AUTH_TOKEN")  # если задан — требуется Bearer-заголовок
 SYMBOLS_CACHE_TTL_SECONDS = 300
+
+# Авторизация — персональные токены (см. auth.py / manage_users.py), не общий
+# секрет. Пока в БД нет ни одного пользователя, API открыт (рассчитано на то, что
+# доступ и так ограничен сетью — localhost/Tailscale). Старый MARKET_DATA_AUTH_TOKEN
+# (общий секрет на всех) снят — см. README, раздел про публикацию.
+
+# CORS: домен(ы), с которых разрешено обращаться к API. Не задан — разрешено
+# всё (allow_origins=["*"]), это нормально для localhost/Tailscale (сеть уже закрыта),
+# но НЕДОПУСТИМО при публикации через Cloudflare Tunnel/ngrok — там обязательно
+# указать точный публичный адрес фронтенда.
+# Пример: MARKET_DATA_ALLOWED_ORIGIN=https://data.example.com
+ALLOWED_ORIGIN = os.environ.get("MARKET_DATA_ALLOWED_ORIGIN")
